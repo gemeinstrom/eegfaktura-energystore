@@ -1,11 +1,16 @@
 package ebow
 
 import (
-	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
-	"github.com/stretchr/testify/assert"
+	"sync"
 	"testing"
 	"time"
+
+	"github.com/spf13/viper"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 var (
@@ -50,8 +55,8 @@ func TestTenantIsolation(t *testing.T) {
 	dbB := connectionPool.Get(tenantB, ecId)
 	assert.NotNil(t, dbB)
 
-	objA := connectionPool.pool[poolKey(tenantA, ecId)]
-	objB := connectionPool.pool[poolKey(tenantB, ecId)]
+	objA, _ := connectionPool.lookup(tenantA, ecId)
+	objB, _ := connectionPool.lookup(tenantB, ecId)
 	assert.NotNil(t, objA)
 	assert.NotNil(t, objB)
 	// Getrennte Pool-Objekte, jeweils unter dem eigenen Mandanten.
@@ -83,53 +88,185 @@ func TestOpenStorageRejectsInvalidIds(t *testing.T) {
 }
 
 func TestPutEmptyDbObj(t *testing.T) {
-	connectionPool.Put(testRc, testEcId, nil)
+	connectionPool.Put("TE999998", testEcId, nil)
 
-	assert.Nil(t, connectionPool.pool[poolKey(testRc, testEcId)])
+	_, ok := connectionPool.lookup("TE999998", testEcId)
+	assert.False(t, ok)
 }
 
 func TestOpenObject(t *testing.T) {
+	vlogGCTestBase(t)
 	db := connectionPool.Get(testRc, testEcId)
 	assert.NotNil(t, db)
 
-	dbObj := connectionPool.pool[poolKey(testRc, testEcId)]
-	assert.Equal(t, len(dbObj.pool), 19)
+	dbObj, _ := connectionPool.lookup(testRc, testEcId)
+	assert.Equal(t, 19, dbObj.available())
 
 	connectionPool.Put(testRc, testEcId, db)
-	assert.Nil(t, dbObj.db)
-	assert.Equal(t, len(dbObj.pool), 20)
-
-	fmt.Printf("%+v\n", dbObj)
+	assert.Nil(t, db.Db)
+	assert.Equal(t, 20, dbObj.available())
+	dbObj.mu.Lock()
+	assert.Nil(t, dbObj.db, "letzte Rueckgabe schliesst die DB")
+	dbObj.mu.Unlock()
 }
 
+// TestOpenMaxObject: das 21. Get wartet, bis ein Handle zurueckkommt.
 func TestOpenMaxObject(t *testing.T) {
-	var db [21]*DbObject
-	wg := NewCountedWait(20)
-
-	go func() {
-		for i := 0; i < 21; i++ {
-			db[i] = connectionPool.Get(testRc, testEcId)
-			assert.NotNil(t, db[i])
-			assert.NotNil(t, db[i].Db)
-			wg.Done()
-		}
-	}()
-
-	wg.Wait()
-	dbObj := connectionPool.pool[poolKey(testRc, testEcId)]
-	assert.Equal(t, len(dbObj.pool), 0)
-	assert.Nil(t, db[20])
-
-	for i := 0; i < 20; i++ {
-		connectionPool.Put(testRc, testEcId, db[i])
-		assert.Nil(t, db[i].Db)
+	vlogGCTestBase(t)
+	var db [20]*DbObject
+	for i := range db {
+		db[i] = connectionPool.Get(testRc, testEcId)
+		assert.NotNil(t, db[i].Db)
 	}
-	assert.Equal(t, len(dbObj.pool), 19)
+	dbObj, _ := connectionPool.lookup(testRc, testEcId)
+	assert.Equal(t, 0, dbObj.available())
 
-	time.Sleep(500 * time.Microsecond)
-	assert.NotNil(t, db[20].Db)
+	got := make(chan *DbObject)
+	go func() { got <- connectionPool.Get(testRc, testEcId) }()
 
-	connectionPool.Put(testRc, testEcId, db[20])
-	assert.Nil(t, db[20].Db)
-	assert.Equal(t, len(dbObj.pool), 20)
+	select {
+	case <-got:
+		t.Fatal("Get darf bei ausgeschoepftem Pool nicht zurueckkommen")
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	connectionPool.Put(testRc, testEcId, db[0])
+	var extra *DbObject
+	select {
+	case extra = <-got:
+	case <-time.After(2 * time.Second):
+		t.Fatal("wartendes Get bekam das zurueckgegebene Handle nicht")
+	}
+	assert.NotNil(t, extra.Db)
+	assert.False(t, extra.Db.Badger().IsClosed())
+
+	for i := 1; i < 20; i++ {
+		connectionPool.Put(testRc, testEcId, db[i])
+	}
+	connectionPool.Put(testRc, testEcId, extra)
+	assert.Equal(t, 20, dbObj.available())
+}
+
+// TestPutTwiceIsIgnored: ein zweites Put desselben Handles zaehlt nicht doppelt.
+func TestPutTwiceIsIgnored(t *testing.T) {
+	vlogGCTestBase(t)
+	a := connectionPool.Get(testRc, testEcId)
+	b := connectionPool.Get(testRc, testEcId)
+	connectionPool.Put(testRc, testEcId, a)
+	connectionPool.Put(testRc, testEcId, a)
+
+	dbObj, _ := connectionPool.lookup(testRc, testEcId)
+	assert.Equal(t, 19, dbObj.available())
+	assert.False(t, b.Db.Badger().IsClosed(), "doppeltes Put darf die DB eines anderen Nutzers nicht schliessen")
+	connectionPool.Put(testRc, testEcId, b)
+}
+
+// TestPoolConcurrentGetPut stellt das Muster GC gegen Import nach: mehrere Goroutinen holen und
+// geben Handles derselben DB und anderer Mandanten zurueck, die DB wird dabei laufend geschlossen
+// und wieder geoeffnet. Kein ausgegebenes Handle darf auf eine geschlossene DB zeigen; mit -race
+// darf es keine Data Race geben (frueher: Map ohne gemeinsame Sperre, Schliessen ausserhalb von mu).
+func TestPoolConcurrentGetPut(t *testing.T) {
+	vlogGCTestBase(t)
+	tenants := []string{"TE000101", "TE000102", "TE000103"}
+	const workers = 8
+	const rounds = 40
+
+	var wg sync.WaitGroup
+	errs := make(chan string, workers*rounds)
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func(w int) {
+			defer wg.Done()
+			tenant := tenants[w%len(tenants)]
+			for r := 0; r < rounds; r++ {
+				obj := connectionPool.Get(tenant, testEcId)
+				if obj == nil || obj.Db == nil {
+					errs <- "Get lieferte kein Handle"
+					continue
+				}
+				if obj.Db.Badger().IsClosed() {
+					errs <- "Get lieferte eine geschlossene DB"
+				}
+				connectionPool.Put(tenant, testEcId, obj)
+			}
+		}(w)
+	}
+	wg.Wait()
+	close(errs)
+	for e := range errs {
+		t.Error(e)
+	}
+	for _, tenant := range tenants {
+		dbObj, ok := connectionPool.lookup(tenant, testEcId)
+		if assert.True(t, ok) {
+			assert.Equal(t, 20, dbObj.available())
+		}
+	}
+}
+
+// TestPoolCloseWakesWaitersAndRefusesGet: nach Close bekommt ein wartendes Get nil statt zu
+// haengen, und ein spaeteres Get oeffnet keine DB mehr; ausgegebene Handles lassen sich noch
+// zurueckgeben.
+func TestPoolCloseWakesWaitersAndRefusesGet(t *testing.T) {
+	vlogGCTestBase(t)
+	p := NewPool(1)
+	held := p.Get(testRc, testEcId)
+	assert.NotNil(t, held)
+
+	got := make(chan *DbObject)
+	go func() { got <- p.Get(testRc, testEcId) }()
+	awaitWaiting(t, p, 1)
+
+	p.Close()
+	select {
+	case o := <-got:
+		assert.Nil(t, o)
+	case <-time.After(2 * time.Second):
+		t.Fatal("wartendes Get haengt nach Close")
+	}
+	assert.Nil(t, p.Get(testRc, testEcId))
+	assert.Nil(t, p.Get(testRc, "OTHERECID01"), "auch fuer eine neue ecId kein Oeffnen nach Close")
+	p.Put(testRc, testEcId, held)
+}
+
+// TestFailedOpenWakesNextWaiter: schlaegt das Oeffnen fuer einen geweckten Get fehl, muss er
+// den naechsten Wartenden wecken, sonst haengt dieser trotz freiem Platz.
+func TestFailedOpenWakesNextWaiter(t *testing.T) {
+	base := vlogGCTestBase(t)
+	p := NewPool(1)
+	held := p.Get(testRc, testEcId)
+	assert.NotNil(t, held)
+
+	got := make(chan *DbObject, 2)
+	for i := 0; i < 2; i++ {
+		go func() { got <- p.Get(testRc, testEcId) }()
+	}
+	awaitWaiting(t, p, 2)
+
+	// Ab jetzt schlaegt jedes Oeffnen fehl: der Basispfad ist eine Datei.
+	notDir := filepath.Join(base, "not-a-dir")
+	assert.NoError(t, os.WriteFile(notDir, []byte("x"), 0o600))
+	viper.Set("persistence.path", notDir) // vlogGCTestBase restores the old path
+
+	p.Put(testRc, testEcId, held) // letzte Rueckgabe schliesst die DB, beide Wartenden muessen oeffnen
+	for i := 0; i < 2; i++ {
+		select {
+		case o := <-got:
+			assert.Nil(t, o)
+		case <-time.After(2 * time.Second):
+			t.Fatal("zweiter Wartender wurde nach fehlgeschlagenem Oeffnen nicht geweckt")
+		}
+	}
+}
+
+// awaitWaiting waits until n Get calls of testRc/testEcId wait for a free handle.
+func awaitWaiting(t *testing.T, p *Pool, n int) {
+	t.Helper()
+	obj, ok := p.lookup(testRc, testEcId)
+	require.True(t, ok)
+	require.Eventually(t, func() bool {
+		obj.mu.Lock()
+		defer obj.mu.Unlock()
+		return obj.waiting == n
+	}, 5*time.Second, time.Millisecond, "%d waiting Get", n)
 }
